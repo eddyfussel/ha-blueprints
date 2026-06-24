@@ -1,0 +1,101 @@
+blueprint:
+  name: "Restart thermostat valve adaptation"
+  description: >
+    Bugfix: after a firmware update or battery change, the thermostat resets its
+    valve-adaptation state to 'none' or 'ready_to_calibrate' and opens the valve
+    fully — so it heats unintentionally. That's especially bad during remote
+    updates when nobody's home.
+
+    This catches that state, restarts adaptation right away to recalibrate the
+    valve, sends a critical push, and announces it in the room.
+  domain: automation
+  author: "eddyfussel"
+  source_url: https://github.com/eddyfussel/ha-blueprints/blob/main/automation/thermostat_valve_adapt.yaml
+  input:
+    valve_adapt_status_sensor:
+      name: Valve adaptation status sensor
+      description: >
+        The thermostat sensor that reports valve-adaptation status
+        (e.g. sensor.ba_climate_01_valve_adapt_status).
+      selector:
+        entity:
+          domain: sensor
+    valve_adapt_button:
+      name: Valve adaptation button
+      description: >
+        The thermostat button that starts adaptation
+        (e.g. button.ba_climate_01_valve_adapt_process).
+      selector:
+        entity:
+          domain: button
+    notify_target:
+      name: Notify service
+      description: >
+        The notify service for the critical push, e.g.
+        notify.mobile_app_<your_phone>. Must be set per automation.
+      selector:
+        text:
+    language:
+      name: Output language
+      description: Language for the push notification and voice announcement. The code stays English.
+      default: de
+      selector:
+        select:
+          options:
+            - value: de
+              label: Deutsch
+            - value: en
+              label: English
+
+trigger:
+  - platform: state
+    entity_id: !input valve_adapt_status_sensor
+    to: "none"
+  - platform: state
+    entity_id: !input valve_adapt_status_sensor
+    to: "ready_to_calibrate"
+
+condition: []
+
+variables:
+  language: !input language
+  status_sensor: !input valve_adapt_status_sensor
+  room: "{{ area_name(status_sensor) or ('einem unbekannten Raum' if language == 'de' else 'an unknown room') }}"
+  area: "{{ area_id(status_sensor) }}"
+
+action:
+  # 1. Restart adaptation immediately
+  - action: button.press
+    target:
+      entity_id: !input valve_adapt_button
+
+  # 2. Critical push (language-aware text)
+  - action: !input notify_target
+    data:
+      title: >-
+        {{ ('🔥 Thermostat-Bug erkannt (' ~ room ~ ')') if language == 'de'
+           else ('🔥 Thermostat bug caught (' ~ room ~ ')') }}
+      message: >-
+        {% if language == 'de' %}Der Thermostat im {{ room }} hat den Adaptionsstatus zurückgesetzt ({{ trigger.to_state.state }}) und das Ventil voll geöffnet. Die Adaption wurde automatisch neu gestartet, um ungewolltes Heizen zu verhindern.{% else %}The {{ room }} thermostat reset its adaptation state ({{ trigger.to_state.state }}) and opened the valve fully. Adaptation was restarted automatically to stop unwanted heating.{% endif %}
+      data:
+        push:
+          interruption-level: critical
+          sound:
+            name: "default"
+            critical: 1
+            volume: 1.0
+        tag: "valve_adapt_{{ status_sensor }}"
+
+  # 3. Voice announcement in the room (only if it has an area)
+  - if:
+      - condition: template
+        value_template: "{{ area is not none and area | length > 0 }}"
+    then:
+      - action: script.announce_in_area
+        data:
+          area: "{{ area }}"
+          message: >-
+            {% if language == 'de' %}Achtung: Der Thermostat im {{ room }} wurde gerade neu kalibriert, um ungewolltes Heizen zu verhindern.{% else %}Heads up: the {{ room }} thermostat was just recalibrated to stop unwanted heating.{% endif %}
+          preannounce: true
+
+mode: single

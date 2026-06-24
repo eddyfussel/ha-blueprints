@@ -1,0 +1,235 @@
+blueprint:
+  name: Smart Vacuum — Vacuum & Mop
+  description: |
+    The idea: when I get home, it shouldn't be dirty.
+
+    Starts the robot once both residents have been away for a set time, and
+    cleans only the rooms not vacuumed in more than N days. If the weekly mop is
+    overdue (last mop older than the threshold), the next run uses
+    vacuum_and_mop mode.
+
+    Works with the stop automation (vacuum_comfort_home) that pauses the robot
+    when someone gets home. If a run is cut short, the unfinished rooms are
+    simply due again on the next absence — no daily counter needed.
+
+    Each room keeps a "last vacuumed" timestamp sensor (e.g.
+    sensor.living_room_last_vacuumed) that survives restarts.
+  domain: automation
+  author: eddyfussel
+  source_url: https://github.com/eddyfussel/ha-blueprints/blob/main/automation/vacuum_smart_clean.yaml
+  input:
+    vacuum_section:
+      name: Vacuum & control
+      icon: mdi:robot-vacuum
+      input:
+        vacuum_entity:
+          name: Vacuum
+          description: The vacuum entity to control (type vacuum). Used to check whether it's docked.
+          selector:
+            entity:
+              domain: vacuum
+        mode_select:
+          name: Vacuum mode select
+          description: The select entity that switches between vacuum and vacuum_and_mop (type select).
+          selector:
+            entity:
+              domain: select
+        mqtt_segment_topic:
+          name: MQTT topic for segment cleaning
+          description: |
+            Topic the cleaning command is published to.
+            Example: valetudo/<RobotName>/MapSegmentationCapability/clean/set
+          selector:
+            text:
+
+    presence_section:
+      name: Presence
+      icon: mdi:account-group
+      input:
+        presence_count:
+          name: Residents present (number entity)
+          description: Number entity holding how many residents are home (type number). When it stays 0 for the wait time below, a run starts.
+          selector:
+            entity:
+              domain: number
+
+    rooms_section:
+      name: Rooms & tracking
+      icon: mdi:floor-plan
+      input:
+        rooms:
+          name: Rooms with sensor & segment ID
+          description: |
+            List of rooms to clean, as YAML. Each entry needs:
+              - sensor: entity_id of the "last vacuumed" timestamp sensor
+              - segment_id: Valetudo segment ID (integer or string)
+
+            Example:
+              - sensor: sensor.living_room_last_vacuumed
+                segment_id: 7
+              - sensor: sensor.kitchen_last_vacuumed
+                segment_id: 1
+          selector:
+            object:
+        last_mopped_sensor:
+          name: Last-mopped sensor
+          description: Timestamp sensor logging the last mop run (type sensor, device_class timestamp).
+          selector:
+            entity:
+              domain: sensor
+              device_class: timestamp
+
+    schedule_section:
+      name: Schedule & thresholds
+      icon: mdi:clock-outline
+      input:
+        min_absence_minutes:
+          name: Min. absence (minutes)
+          description: How long both residents must be away before a run starts.
+          default: 30
+          selector:
+            number:
+              min: 5
+              max: 240
+              step: 5
+              unit_of_measurement: min
+              mode: slider
+        max_days_per_room:
+          name: Max. days per room without vacuuming
+          description: Rooms not vacuumed for longer than this are due on the next run.
+          default: 3
+          selector:
+            number:
+              min: 1
+              max: 14
+              step: 1
+              unit_of_measurement: days
+              mode: slider
+        max_days_between_mops:
+          name: Max. days between mop runs
+          description: If the last mop is older than this, the next run uses vacuum_and_mop. 3 days is about twice a week.
+          default: 3
+          selector:
+            number:
+              min: 1
+              max: 14
+              step: 1
+              unit_of_measurement: days
+              mode: slider
+        earliest_start:
+          name: Earliest start of day
+          description: No run starts before this time.
+          default: "09:00:00"
+          selector:
+            time:
+        latest_start:
+          name: Latest start of day
+          description: No new run starts after this time.
+          default: "20:00:00"
+          selector:
+            time:
+
+mode: single
+max_exceeded: silent
+
+trigger:
+  # Edge trigger: fires when presence drops from >=1 to <1 and stays there
+  # for min_absence_minutes.
+  - platform: numeric_state
+    entity_id: !input presence_count
+    below: 1
+    for:
+      minutes: !input min_absence_minutes
+    id: presence_drop
+  # Restart trigger: if HA restarts mid-absence, the numeric_state trigger
+  # won't fire (no state change). This catches that case; the conditions below
+  # still enforce the full logic (presence + absence duration).
+  - platform: homeassistant
+    event: start
+    id: ha_start
+
+variables:
+  rooms_list: !input rooms
+  max_days_room: !input max_days_per_room
+  max_days_mop: !input max_days_between_mops
+  last_mopped_sensor_id: !input last_mopped_sensor
+  presence_count_entity: !input presence_count
+  min_absence: !input min_absence_minutes
+
+  due_segments: |-
+    {%- set ns = namespace(segments=[]) -%}
+    {%- set max_h = (max_days_room | int) * 24 -%}
+    {%- for room in rooms_list -%}
+      {%- set last = states(room.sensor) -%}
+      {%- if last in ['unknown', 'unavailable', 'None', none] -%}
+        {%- set ns.segments = ns.segments + [room.segment_id | string] -%}
+      {%- else -%}
+        {%- set last_dt = as_datetime(last) -%}
+        {%- if last_dt is not none -%}
+          {%- set hours_ago = (now() - last_dt).total_seconds() / 3600 -%}
+          {%- if hours_ago > max_h -%}
+            {%- set ns.segments = ns.segments + [room.segment_id | string] -%}
+          {%- endif -%}
+        {%- else -%}
+          {%- set ns.segments = ns.segments + [room.segment_id | string] -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {{ ns.segments }}
+
+  should_mop: |-
+    {%- set last_mop = states(last_mopped_sensor_id) -%}
+    {%- if last_mop in ['unknown', 'unavailable', 'None', none] -%}
+      true
+    {%- else -%}
+      {%- set last_mop_dt = as_datetime(last_mop) -%}
+      {%- if last_mop_dt is none -%}
+        true
+      {%- else -%}
+        {%- set days_ago = (now() - last_mop_dt).total_seconds() / 86400 -%}
+        {{ days_ago > (max_days_mop | int) }}
+      {%- endif -%}
+    {%- endif -%}
+
+condition:
+  # Presence currently below 1 (matters for the restart trigger).
+  # For the edge trigger this is already true.
+  - condition: numeric_state
+    entity_id: !input presence_count
+    below: 1
+  # At least min_absence_minutes without a presence change.
+  # The edge trigger's for-clause already guarantees this; for the restart
+  # trigger this condition enforces the same wait window.
+  - condition: template
+    value_template: >
+      {{ (now() - states[presence_count_entity].last_changed).total_seconds()
+         >= (min_absence | int) * 60 }}
+  - condition: time
+    after: !input earliest_start
+    before: !input latest_start
+  - condition: state
+    entity_id: !input vacuum_entity
+    state: docked
+  - condition: template
+    value_template: "{{ due_segments | length > 0 }}"
+
+action:
+  - alias: "Set mode depending on whether to mop"
+    service: select.select_option
+    target:
+      entity_id: !input mode_select
+    data:
+      option: "{{ 'vacuum_and_mop' if should_mop else 'vacuum' }}"
+
+  - alias: "Brief pause so the mode change reaches the robot"
+    delay:
+      seconds: 2
+
+  - alias: "Send the cleaning command to the vacuum"
+    service: mqtt.publish
+    data:
+      topic: !input mqtt_segment_topic
+      payload: >-
+        {"segment_ids": {{ due_segments | tojson }}, "iterations": 1, "customOrder": true}
+      qos: 0
+      retain: false

@@ -1,0 +1,142 @@
+blueprint:
+  name: "Sync room temperature to thermostat"
+  description: >
+    Feeds a room sensor's temperature into a thermostat's external-temperature
+    input, so it regulates on the real room temp instead of the warmer reading
+    at the valve.
+
+    If the sensor drops out for more than 5 minutes, it raises a Repairs issue
+    and clears it automatically once a real value comes back. Short
+    Zigbee2MQTT/MQTT blips (~1 min) are ignored: 'unavailable' and 'unknown'
+    both count as down, and the issue clears on the first real value — so a
+    recovery that passes through 'unknown' is handled correctly.
+  domain: automation
+  author: "eddyfussel"
+  source_url: https://github.com/eddyfussel/ha-blueprints/blob/main/automation/sync_room_temp.yaml
+  input:
+    temperature_sensor:
+      name: Temperature sensor
+      description: The sensor whose temperature is sent to the thermostat.
+      selector:
+        entity:
+          domain: sensor
+          device_class: temperature
+    thermostat_remote_temperature:
+      name: Thermostat external-temperature entity
+      description: The thermostat's number entity for the external temperature input.
+      selector:
+        entity:
+          domain: number
+    language:
+      name: Output language
+      description: Language for the Repairs message shown to the user. The code stays English.
+      default: de
+      selector:
+        select:
+          options:
+            - value: de
+              label: Deutsch
+            - value: en
+              label: English
+
+trigger:
+  # Sensor down (unavailable OR unknown) for at least 5 minutes.
+  # Short Z2M/MQTT blips don't raise an issue.
+  - platform: state
+    entity_id: !input temperature_sensor
+    to:
+      - "unavailable"
+      - "unknown"
+    for:
+      minutes: 5
+    id: "sensor_down"
+  # Sensor reports a real value -> sync, and clear the issue if it was down.
+  - platform: state
+    entity_id: !input temperature_sensor
+    not_to:
+      - "unavailable"
+      - "unknown"
+    id: "sensor_update"
+  # Re-check so a manually dismissed issue reappears while the problem persists.
+  - platform: time_pattern
+    minutes: "/30"
+    id: "periodic_check"
+
+condition: []
+
+variables:
+  language: !input language
+  sensor_id: !input temperature_sensor
+  issue_id: "sync_temp_unavailable_{{ sensor_id | replace('.', '_') }}"
+  room: "{{ area_name(sensor_id) or ('einem unbekannten Raum' if language == 'de' else 'an unknown room') }}"
+
+action:
+  - choose:
+      # 1) Down for >= 5 min -> (re)create the issue.
+      - conditions:
+          - condition: trigger
+            id: "sensor_down"
+        sequence:
+          - action: repairs.remove
+            data:
+              issue_id: "{{ issue_id }}"
+            continue_on_error: true
+          - action: repairs.create
+            data:
+              issue_id: "{{ issue_id }}"
+              domain: "homeassistant"
+              title: >-
+                {{ ('Temperatursensor nicht verfügbar (' ~ room ~ ')') if language == 'de'
+                   else ('Temperature sensor unavailable (' ~ room ~ ')') }}
+              description: >-
+                {% if language == 'de' %}**{{ sensor_id }}** in {{ room }} ist seit mindestens 5 Minuten nicht verfügbar – die Thermostat-Synchronisation pausiert. Bitte den Sensor prüfen (Batterie, Verbindung, Zigbee-Netz).{% else %}**{{ sensor_id }}** in {{ room }} has been unavailable for at least 5 minutes, so thermostat syncing is paused. Check the sensor (battery, connection, Zigbee mesh).{% endif %}
+              severity: "warning"
+              persistent: true
+
+      # 2) Real value -> sync to the thermostat; clear the issue if recovering.
+      - conditions:
+          - condition: trigger
+            id: "sensor_update"
+        sequence:
+          - action: number.set_value
+            target:
+              entity_id: !input thermostat_remote_temperature
+            data:
+              value: "{{ trigger.to_state.state }}"
+          - if:
+              - condition: template
+                value_template: >
+                  {{ trigger.from_state is not none
+                     and trigger.from_state.state in ['unavailable', 'unknown'] }}
+            then:
+              - action: repairs.remove
+                data:
+                  issue_id: "{{ issue_id }}"
+                continue_on_error: true
+
+      # 3) Periodic: only re-raise if still down AND down for >= 5 min.
+      - conditions:
+          - condition: trigger
+            id: "periodic_check"
+          - condition: template
+            value_template: >
+              {{ states(sensor_id) in ['unavailable', 'unknown']
+                 and (now() - states[sensor_id].last_changed).total_seconds() > 300 }}
+        sequence:
+          - action: repairs.remove
+            data:
+              issue_id: "{{ issue_id }}"
+            continue_on_error: true
+          - action: repairs.create
+            data:
+              issue_id: "{{ issue_id }}"
+              domain: "homeassistant"
+              title: >-
+                {{ ('Temperatursensor nicht verfügbar (' ~ room ~ ')') if language == 'de'
+                   else ('Temperature sensor unavailable (' ~ room ~ ')') }}
+              description: >-
+                {% if language == 'de' %}**{{ sensor_id }}** in {{ room }} ist seit längerem nicht verfügbar – die Thermostat-Synchronisation pausiert. Bitte den Sensor prüfen (Batterie, Verbindung, Zigbee-Netz).{% else %}**{{ sensor_id }}** in {{ room }} has been unavailable for a while, so thermostat syncing is paused. Check the sensor (battery, connection, Zigbee mesh).{% endif %}
+              severity: "warning"
+              persistent: true
+
+mode: single
